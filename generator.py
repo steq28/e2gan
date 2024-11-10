@@ -223,8 +223,8 @@ if __name__ == '__main__':
     ])
 
     # Dataset e DataLoader
-    originals_dir = './or_images'
-    filtered_dir = './mod_images'
+    originals_dir = 'e2gan/or_images'
+    filtered_dir = 'e2gan/mod_images'
     
     dataset = ImagePairsDataset(originals_dir, filtered_dir, transform=transform)
     
