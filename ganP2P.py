@@ -102,3 +102,42 @@ class Generator(nn.Module):
         x = torch.tanh(x)  # Simile all'activation='tanh' in TensorFlow
         
         return x
+
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super(Discriminator, self).__init__()
+        
+        # Downsampling layers
+        self.down1 = Downsample(64, 4, apply_batchnorm=False)
+        self.down2 = Downsample(128, 4)
+        self.down3 = Downsample(256, 4)
+        
+        # Additional layers
+        self.zero_pad1 = nn.ZeroPad2d(1)
+        self.conv = nn.Conv2d(256, 512, kernel_size=4, stride=1, padding=0, bias=False)
+        self.batchnorm1 = nn.BatchNorm2d(512)
+        self.leaky_relu = nn.LeakyReLU(0.2, inplace=True)
+        
+        self.zero_pad2 = nn.ZeroPad2d(1)
+        self.last = nn.Conv2d(512, 1, kernel_size=4, stride=1, padding=0)
+    
+    def forward(self, inp, tar):
+        # Concatenazione dell'immagine di input e del target lungo i canali
+        x = torch.cat([inp, tar], dim=1)  # Dimensione finale: (batch_size, 256, 256, channels*2)
+
+        # Downsampling
+        x = self.down1(x)  # (batch_size, 128, 128, 64)
+        x = self.down2(x)  # (batch_size, 64, 64, 128)
+        x = self.down3(x)  # (batch_size, 32, 32, 256)
+        
+        # Strato convolutivo e batch normalization
+        x = self.zero_pad1(x)  # (batch_size, 34, 34, 256)
+        x = self.conv(x)       # (batch_size, 31, 31, 512)
+        x = self.batchnorm1(x)
+        x = self.leaky_relu(x)
+
+        x = self.zero_pad2(x)  # (batch_size, 33, 33, 512)
+        x = self.last(x)       # (batch_size, 30, 30, 1)
+        
+        return x
