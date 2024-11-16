@@ -154,7 +154,6 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-original_images/
 modified_images/
 mod_images/
 or_images/
