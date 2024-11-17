@@ -330,8 +330,8 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Utilizzo device: {device}")
         
-        source_dir = "/kaggle/input/imagesv5/original_images"
-        target_dir = "/kaggle/input/imagesv5/modified_images"
+        source_dir = "e2gan/Images/original_images"
+        target_dir = "e2gan/Images/less_modified_images"
         
         if not os.path.exists(source_dir):
             raise ValueError(f"Directory sorgente non trovata: {source_dir}")
@@ -363,7 +363,7 @@ def main():
         train_e2gan(generator, discriminator, dataloader, num_epochs=200, device=device)
         
         # Test del modello
-        test_image_path = "/kaggle/input/testimage/obama.jpg"
+        test_image_path = "e2gan/obama.jpg"
         if os.path.exists(test_image_path):
             test_e2gan(generator, test_image_path, device)
         else:
