@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torchmetrics.image.fid import FrechetInceptionDistance
 import torchvision.transforms as transforms
 from torchvision.utils import save_image, make_grid
 from PIL import Image
@@ -341,6 +340,8 @@ def main():
         
         # Setup trasformazioni immagini
         transform = transforms.Compose([
+            transforms.Resize(128),          # Ridimensiona a 128x128
+            transforms.CenterCrop(128),      # Crop centrale 128x128
             transforms.ToTensor(),           # Converte in tensor
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Normalizza
         ])
