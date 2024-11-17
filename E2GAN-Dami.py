@@ -220,8 +220,8 @@ def train_e2gan(generator, discriminator, train_loader, num_epochs, device):
     optimizer_g = torch.optim.Adam(generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
     optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
     
-    os.makedirs("images", exist_ok=True)
-    os.makedirs("models", exist_ok=True)
+    os.makedirs("newimages", exist_ok=True)
+    os.makedirs("newmodels", exist_ok=True)
     
     for epoch in range(num_epochs):
         for i, (source, target) in enumerate(tqdm(train_loader)):
