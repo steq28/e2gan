@@ -1,506 +1,377 @@
+# Import delle librerie necessarie
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
-from torchvision.models import resnet50
+from torchvision.utils import save_image, make_grid
 from PIL import Image
+import matplotlib.pyplot as plt
 import os
 import numpy as np
-from sklearn.cluster import KMeans
+from tqdm.notebook import tqdm
 
-def weights_init_normal(m):
-    classname = m.__class__.__name__
-    if classname.find("Conv") != -1:
-        torch.nn.init.normal_(m.weight.data, 0.0, 0.02)
-    elif classname.find("BatchNorm2d") != -1:
-        torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
-        torch.nn.init.constant_(m.bias.data, 0.0)
-
-class ResidualBlock(nn.Module):
+# Blocco ResNet - utilizzato per estrarre features
+class ResNetBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1),
-            nn.InstanceNorm2d(channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, 3, padding=1),
-            nn.InstanceNorm2d(channels)
-        )
-
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.norm1 = nn.InstanceNorm2d(channels)
+        self.norm2 = nn.InstanceNorm2d(channels)
+        
     def forward(self, x):
-        return x + self.block(x)
+        residual = x
+        x = self.conv1(F.relu(self.norm1(x)))
+        x = self.conv2(F.relu(self.norm2(x)))
+        return x + residual
 
+# Blocco Transformer - per l'elaborazione delle features con attention
 class TransformerBlock(nn.Module):
-    def __init__(self, channels, num_heads=8, reduction_factor=2):
+    def __init__(self, dim, num_heads=8):
         super().__init__()
-        self.channels = channels
-        self.num_heads = num_heads
-        
-        # Downsampling
-        self.down = nn.Conv2d(channels, channels, kernel_size=3, 
-                             stride=reduction_factor, padding=1)
-        
-        # Upsampling
-        self.up = nn.ConvTranspose2d(channels, channels, kernel_size=4,
-                                    stride=reduction_factor, padding=1)
-        
-        # Transformer components
-        self.norm1 = nn.GroupNorm(8, channels)
-        self.norm2 = nn.GroupNorm(8, channels)
-        self.self_attention = nn.MultiheadAttention(channels, num_heads)
-        
-        # MLP block
+        self.attention = nn.MultiheadAttention(dim, num_heads)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
-            nn.Linear(channels, channels * 4),
+            nn.Linear(dim, dim * 4),
             nn.GELU(),
-            nn.Linear(channels * 4, channels)
+            nn.Linear(dim * 4, dim)
         )
         
-    def forward(self, x):
-        b, c, h, w = x.shape
-        identity = x
-        
-        # Downsampling
-        x = self.down(x)
-        
-        # Normalization
-        x = self.norm1(x)
-        
+    def forward(self, x, text_embedding=None):
         # Reshape per attention
-        _, _, h_down, w_down = x.shape
-        x_flat = x.flatten(2).permute(2, 0, 1)  # (h*w, batch, channels)
+        x = x.reshape(x.size(0), x.size(1), -1).permute(2, 0, 1)
+        residual = x
         
         # Self attention
-        attn_output, _ = self.self_attention(x_flat, x_flat, x_flat)
+        x = self.norm1(x)
+        x, _ = self.attention(x, x, x)
+        x = residual + x
         
-        # Reshape back e prima skip connection
-        x = attn_output.permute(1, 2, 0).view(b, c, h_down, w_down) + x
+        # Cross attention con il testo se fornito
+        if text_embedding is not None:
+            residual = x
+            x = self.norm1(x)
+            x, _ = self.attention(x, text_embedding, text_embedding)
+            x = residual + x
         
         # MLP
+        residual = x
         x = self.norm2(x)
-        x_mlp = x.view(b, c, -1).permute(0, 2, 1)
-        x_mlp = self.mlp(x_mlp)
-        x = x + x_mlp.permute(0, 2, 1).view(b, c, h_down, w_down)
+        x = self.mlp(x)
+        x = residual + x
         
-        # Upsampling e seconda skip connection
-        x = self.up(x)
-        return x + identity
+        # Reshape ritorno
+        x = x.permute(1, 2, 0).reshape(x.size(1), x.size(2), 32, 32)
+        return x
 
+# Generator del GAN
 class E2GANGenerator(nn.Module):
     def __init__(self, input_channels=3, output_channels=3):
         super().__init__()
         
-        # Initial convolution
-        self.initial = nn.Sequential(
-            nn.Conv2d(input_channels, 64, 7, padding=3),
-            nn.InstanceNorm2d(64),
-            nn.ReLU(inplace=True)
-        )
+        # Convoluzione iniziale
+        self.initial = nn.Conv2d(input_channels, 64, 7, padding=3)
         
         # Downsampling
-        self.down1 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
-            nn.InstanceNorm2d(128),
-            nn.ReLU(inplace=True)
-        )
-        self.down2 = nn.Sequential(
-            nn.Conv2d(128, 256, 3, stride=2, padding=1),
-            nn.InstanceNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
+        self.down1 = nn.Conv2d(64, 128, 3, stride=2, padding=1)
+        self.down2 = nn.Conv2d(128, 256, 3, stride=2, padding=1)
         
-        # Residual blocks
-        self.res1 = ResidualBlock(256)
-        self.res2 = ResidualBlock(256)
+        # Blocchi ResNet
+        self.resblocks = nn.ModuleList([
+            ResNetBlock(256) for _ in range(3)
+        ])
         
-        # Transformer block
+        # Blocco Transformer
         self.transformer = TransformerBlock(256)
         
-        # Third residual block
-        self.res3 = ResidualBlock(256)
-        
         # Upsampling
-        self.up1 = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 3, stride=2, padding=1, output_padding=1),
-            nn.InstanceNorm2d(128),
-            nn.ReLU(inplace=True)
-        )
-        self.up2 = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, 3, stride=2, padding=1, output_padding=1),
-            nn.InstanceNorm2d(64),
-            nn.ReLU(inplace=True)
-        )
+        self.up1 = nn.ConvTranspose2d(256, 128, 3, stride=2, padding=1, output_padding=1)
+        self.up2 = nn.ConvTranspose2d(128, 64, 3, stride=2, padding=1, output_padding=1)
         
-        # Output convolution
-        self.output = nn.Sequential(
-            nn.Conv2d(64, output_channels, 7, padding=3),
-            nn.Tanh()
+        # Convoluzione output
+        self.output = nn.Conv2d(64, output_channels, 7, padding=3)
+        
+    def forward(self, x, text_embedding=None):
+        x = self.initial(x)
+        x = F.relu(self.down1(x))
+        x = F.relu(self.down2(x))
+        
+        for block in self.resblocks:
+            x = block(x)
+            
+        x = self.transformer(x, text_embedding)
+        x = F.relu(self.up1(x))
+        x = F.relu(self.up2(x))
+        x = torch.tanh(self.output(x))
+        return x
+
+# Discriminator del GAN
+class Discriminator(nn.Module):
+    def __init__(self, input_channels=3):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(input_channels, 64, 4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),
+            nn.InstanceNorm2d(128),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(128, 256, 4, stride=2, padding=1),
+            nn.InstanceNorm2d(256),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(256, 1, 4, stride=1, padding=1)
         )
         
     def forward(self, x):
-        x = self.initial(x)
-        x = self.down1(x)
-        x = self.down2(x)
-        
-        x = self.res1(x)
-        x = self.res2(x)
-        x = self.transformer(x)
-        x = self.res3(x)
-        
-        x = self.up1(x)
-        x = self.up2(x)
-        x = self.output(x)
-        
-        return x
+        return self.model(x)
 
-class Discriminator(nn.Module):
-    def __init__(self, in_channels=3):
-        super().__init__()
-
-        def discriminator_block(in_filters, out_filters, normalization=True):
-            layers = [nn.Conv2d(in_filters, out_filters, 4, stride=2, padding=1)]
-            if normalization:
-                layers.append(nn.InstanceNorm2d(out_filters))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
-            return layers
-
-        self.model = nn.Sequential(
-            *discriminator_block(in_channels * 2, 64, normalization=False),
-            *discriminator_block(64, 128),
-            *discriminator_block(128, 256),
-            *discriminator_block(256, 512),
-            nn.ZeroPad2d((1, 0, 1, 0)),
-            nn.Conv2d(512, 1, 4, padding=1, bias=False)
-        )
-
-    def forward(self, img_A, img_B):
-        img_input = torch.cat((img_A, img_B), 1)
-        return self.model(img_input)
-
-class ImagePairsDataset(Dataset):
-    def __init__(self, originals_dir, filtered_dir, transform=None):
-        self.originals_dir = originals_dir
-        self.filtered_dir = filtered_dir
+# Dataset personalizzato per coppie di immagini
+class ImagePairDataset(Dataset):
+    def __init__(self, source_dir, target_dir, transform=None):
+        self.source_dir = source_dir
+        self.target_dir = target_dir
         self.transform = transform
-        self.image_names = os.listdir(originals_dir)
-
+        
+        # Verifica directory
+        if not os.path.exists(source_dir):
+            raise ValueError(f"Directory sorgente non trovata: {source_dir}")
+        if not os.path.exists(target_dir):
+            raise ValueError(f"Directory target non trovata: {target_dir}")
+            
+        # Trova le immagini che esistono in entrambe le directory
+        source_images = set(os.listdir(source_dir))
+        target_images = set(os.listdir(target_dir))
+        self.images = list(source_images.intersection(target_images))
+        
+        if len(self.images) == 0:
+            raise ValueError("Nessuna immagine corrispondente trovata")
+            
+        print(f"Trovate {len(self.images)} immagini corrispondenti")
+        
     def __len__(self):
-        return len(self.image_names)
-
+        return len(self.images)
+    
     def __getitem__(self, idx):
-        image_name = self.image_names[idx]
-        original_path = os.path.join(self.originals_dir, image_name)
-        filtered_path = os.path.join(self.filtered_dir, image_name)
-
-        original_image = Image.open(original_path).convert("RGB")
-        filtered_image = Image.open(filtered_path).convert("RGB")
-
-        if self.transform:
-            original_image = self.transform(original_image)
-            filtered_image = self.transform(filtered_image)
-        
-        return original_image, filtered_image
-
-class DatasetManager:
-    def __init__(self, n_clusters=400):
-        self.feature_extractor = resnet50(pretrained=True)
-        self.feature_extractor.eval()
-        self.n_clusters = n_clusters
-        
-    def extract_features(self, dataset, batch_size=32):
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.feature_extractor = self.feature_extractor.to(device)
-        dataloader = DataLoader(dataset, batch_size=batch_size)
-        features = []
-        
-        with torch.no_grad():
-            for images, _ in dataloader:
-                images = images.to(device)
-                feat = self.feature_extractor(images)
-                features.append(feat.cpu().numpy())
+        try:
+            img_name = self.images[idx]
+            source_path = os.path.join(self.source_dir, img_name)
+            target_path = os.path.join(self.target_dir, img_name)
+            
+            source_image = Image.open(source_path).convert('RGB')
+            target_image = Image.open(target_path).convert('RGB')
+            
+            if self.transform:
+                source_image = self.transform(source_image)
+                target_image = self.transform(target_image)
                 
-        return np.concatenate(features)
+            return source_image, target_image
+        except Exception as e:
+            print(f"Errore caricamento immagine {img_name}: {str(e)}")
+            raise e
+
+# Funzione per salvare le griglie di confronto
+def create_comparison_grid(source_images, generated_images, target_images, epoch):
+    plt.figure(figsize=(15, 10))
+    plt.suptitle(f'Confronto Epoch {epoch}', fontsize=16, y=0.95)
     
-    def create_clustered_dataset(self, original_dataset):
-        # Estrai features
-        features = self.extract_features(original_dataset)
-        features = features.reshape(features.shape[0], -1)  # Appiattisci le features
-        
-        # Applica K-means
-        kmeans = KMeans(n_clusters=self.n_clusters, random_state=42)
-        clusters = kmeans.fit_predict(features)
-        
-        # Seleziona le immagini più vicine ai centroidi
-        selected_indices = []
-        for i in range(self.n_clusters):
-            cluster_points = features[clusters == i]
-            cluster_indices = np.where(clusters == i)[0]
+    num_images = min(4, source_images.shape[0])
+    titles = ['Immagine Input', 'Immagine Generata', 'Immagine Target']
+    
+    for i in range(num_images):
+        for j in range(3):
+            plt.subplot(num_images, 3, i*3 + j + 1)
             
-            # Trova il punto più vicino al centroide
-            if len(cluster_points) > 0:  # Verifica che il cluster non sia vuoto
-                centroid = kmeans.cluster_centers_[i]
-                distances = np.linalg.norm(cluster_points - centroid, axis=1)
-                closest_idx = cluster_indices[np.argmin(distances)]
-                selected_indices.append(closest_idx)
+            if j == 0:
+                img = source_images[i]
+            elif j == 1:
+                img = generated_images[i]
+            else:
+                img = target_images[i]
+                
+            img_np = img.cpu().numpy().transpose(1, 2, 0)
+            img_np = (img_np * 0.5 + 0.5).clip(0, 1)
             
-        return torch.utils.data.Subset(original_dataset, selected_indices)
+            plt.imshow(img_np)
+            plt.title(f'{titles[j]} {i+1}', fontsize=10)
+            plt.axis('off')
+    
+    plt.figtext(0.05, 0.02, 
+                f'Dettagli Griglia:\n'
+                f'- Prima riga: Immagini originali\n'
+                f'- Seconda riga: Immagini generate\n'
+                f'- Terza riga: Immagini target\n', 
+                fontsize=8, 
+                bbox=dict(facecolor='white', alpha=0.8))
+    
+    plt.tight_layout()
+    plt.savefig(f'images/confronto_epoch_{epoch}.png', 
+                dpi=300, 
+                bbox_inches='tight')
+    plt.close()
 
-def calculate_fid(real_features, fake_features):
-    # Calcola media e covarianza per le features reali
-    mu1 = np.mean(real_features, axis=0)
-    sigma1 = np.cov(real_features, rowvar=False)
+# Funzione di training
+def train_e2gan(generator, discriminator, train_loader, num_epochs, device):
+    # Funzioni di loss
+    criterion_gan = nn.MSELoss()
+    criterion_pixel = nn.L1Loss()
     
-    # Calcola media e covarianza per le features generate
-    mu2 = np.mean(fake_features, axis=0)
-    sigma2 = np.cov(fake_features, rowvar=False)
+    # Optimizers
+    optimizer_g = torch.optim.Adam(generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
+    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
     
-    # Calcola la distanza tra le distribuzioni
-    diff = mu1 - mu2
+    os.makedirs("images", exist_ok=True)
+    os.makedirs("models", exist_ok=True)
     
-    # Calcola la matrice covarianza
-    covmean = np.sqrt(sigma1.dot(sigma2))
-    
-    # Calcola FID
-    fid = np.sum(diff**2) + np.trace(sigma1 + sigma2 - 2*covmean)
-    
-    return fid
-
-def evaluate_model(generator, dataloader, device):
-    generator.eval()
-    feature_extractor = resnet50(pretrained=True).to(device)
-    feature_extractor.eval()
-    
-    real_features = []
-    fake_features = []
-    
-    with torch.no_grad():
-        for real_A, real_B in dataloader:
-            real_A = real_A.to(device)
-            real_B = real_B.to(device)
-            
-            # Genera immagini fake
-            fake_B = generator(real_A)
-            
-            # Estrai features
-            real_feat = feature_extractor(real_B).cpu().numpy()
-            fake_feat = feature_extractor(fake_B).cpu().numpy()
-            
-            real_features.append(real_feat)
-            fake_features.append(fake_feat)
-    
-    real_features = np.concatenate(real_features)
-    fake_features = np.concatenate(fake_features)
-    
-    return calculate_fid(real_features, fake_features)
-
-def train_e2gan(generator, discriminator, train_loader, val_loader, num_epochs, device, save_path):
-    criterion_GAN = torch.nn.MSELoss()
-    criterion_pixel = torch.nn.L1Loss()
-    lambda_pixel = 100
-
-    optimizer_G = torch.optim.Adam(generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
-    optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
-
-    lr_scheduler_G = torch.optim.lr_scheduler.LinearLR(optimizer_G, 
-                                                      start_factor=1.0,
-                                                      end_factor=0.5,
-                                                      total_iters=num_epochs//2)
-    lr_scheduler_D = torch.optim.lr_scheduler.LinearLR(optimizer_D,
-                                                      start_factor=1.0,
-                                                      end_factor=0.5,
-                                                      total_iters=num_epochs//2)
-
-    best_fid = float('inf')
-    metrics = {
-        'g_losses': [],
-        'd_losses': [],
-        'pixel_losses': [],
-        'fid_scores': []
-    }
-
     for epoch in range(num_epochs):
-        generator.train()
-        discriminator.train()
-        
-        epoch_g_losses = []
-        epoch_d_losses = []
-        epoch_pixel_losses = []
-        
-        for i, (real_A, real_B) in enumerate(train_loader):
-            batch_size = real_A.size(0)
-            real_A = real_A.to(device)
-            real_B = real_B.to(device)
-
-            valid = torch.ones((batch_size, 1, 16, 16), requires_grad=False).to(device)
-            fake = torch.zeros((batch_size, 1, 16, 16), requires_grad=False).to(device)
-
-            # Train Generator
-            optimizer_G.zero_grad()
-            fake_B = generator(real_A)
-            pred_fake = discriminator(fake_B, real_A)
-            loss_GAN = criterion_GAN(pred_fake, valid)
-            loss_pixel = criterion_pixel(fake_B, real_B)
-            loss_G = loss_GAN + lambda_pixel * loss_pixel
-            loss_G.backward()
-            optimizer_G.step()
-
-            # Train Discriminator
-            optimizer_D.zero_grad()
-            pred_real = discriminator(real_B, real_A)
-            loss_real = criterion_GAN(pred_real, valid)
-            pred_fake = discriminator(fake_B.detach(), real_A)
-            loss_fake = criterion_GAN(pred_fake, fake)
-            loss_D = (loss_real + loss_fake) / 2
-            loss_D.backward()
-            optimizer_D.step()
-
-            # Save losses
-            epoch_g_losses.append(loss_G.item())
-            epoch_d_losses.append(loss_D.item())
-            epoch_pixel_losses.append(loss_pixel.item())
-
+        for i, (source, target) in enumerate(tqdm(train_loader)):
+            batch_size = source.size(0)
+            real = target.to(device)
+            source = source.to(device)
+            
+            # Embedding di testo dummy
+            text_embedding = torch.randn(16, batch_size, 256).to(device)
+            
+            # Training Discriminator
+            optimizer_d.zero_grad()
+            fake = generator(source, text_embedding)
+            pred_real = discriminator(real)
+            pred_fake = discriminator(fake.detach())
+            
+            loss_d_real = criterion_gan(pred_real, torch.ones_like(pred_real))
+            loss_d_fake = criterion_gan(pred_fake, torch.zeros_like(pred_fake))
+            loss_d = (loss_d_real + loss_d_fake) * 0.5
+            loss_d.backward()
+            optimizer_d.step()
+            
+            # Training Generator
+            optimizer_g.zero_grad()
+            pred_fake = discriminator(fake)
+            loss_g_gan = criterion_gan(pred_fake, torch.ones_like(pred_fake))
+            loss_g_pixel = criterion_pixel(fake, real) * 100
+            loss_g = loss_g_gan + loss_g_pixel
+            loss_g.backward()
+            optimizer_g.step()
+            
             if i % 100 == 0:
-                print(f"\rEpoch [{epoch}/{num_epochs}] Batch [{i}/{len(train_loader)}] "
-                      f"d_loss: {loss_D.item():.4f}, g_loss: {loss_G.item():.4f}", end="")
-
-        # Save epoch metrics
-        metrics['g_losses'].append(np.mean(epoch_g_losses))
-        metrics['d_losses'].append(np.mean(epoch_d_losses))
-        metrics['pixel_losses'].append(np.mean(epoch_pixel_losses))
-
-        # Validation phase
-        generator.eval()
-        val_fid = evaluate_model(generator, val_loader, device)
-        metrics['fid_scores'].append(val_fid)
+                print(f"[Epoch {epoch}/{num_epochs}] [Batch {i}/{len(train_loader)}] "
+                      f"[D loss: {loss_d.item():.4f}] [G loss: {loss_g.item():.4f}]")
         
-        if val_fid < best_fid:
-            best_fid = val_fid
-            os.makedirs(save_path, exist_ok=True)
-            torch.save({
-                'epoch': epoch,
+        # Salva confronti solo agli epoch 100 e 200
+        if epoch + 1 in [100, 200]:
+            with torch.no_grad():
+                fake = generator(source[:4], text_embedding[:, :4])
+                create_comparison_grid(source[:4], fake.data, real[:4], epoch + 1)
+                
+                # Salva anche le metriche
+                metrics = {
+                    'Loss Discriminator': loss_d.item(),
+                    'Loss Generator': loss_g.item(),
+                    'Loss Pixel': loss_g_pixel.item(),
+                }
+                
+                with open(f'images/metriche_epoch_{epoch + 1}.txt', 'w') as f:
+                    f.write(f"Metriche Training Epoch {epoch + 1}:\n")
+                    for nome_metrica, valore in metrics.items():
+                        f.write(f"{nome_metrica}: {valore:.4f}\n")
+        
+        # Salva il modello finale
+        if epoch + 1 == num_epochs:
+            checkpoint = {
+                'epoch': num_epochs,
                 'generator_state_dict': generator.state_dict(),
                 'discriminator_state_dict': discriminator.state_dict(),
-                'optimizer_G_state_dict': optimizer_G.state_dict(),
-                'optimizer_D_state_dict': optimizer_D.state_dict(),
-                'metrics': metrics
-            }, f'{save_path}/best_model.pt')
+                'optimizer_g_state_dict': optimizer_g.state_dict(),
+                'optimizer_d_state_dict': optimizer_d.state_dict(),
+            }
+            torch.save(checkpoint, 'models/e2gan_finale.pth')
+            print("Modello salvato!")
 
-        # Step the schedulers
-        lr_scheduler_G.step()
-        lr_scheduler_D.step()
-
-        print(f"\nEpoch [{epoch}/{num_epochs}] "
-              f"d_loss: {metrics['d_losses'][-1]:.4f}, "
-              f"g_loss: {metrics['g_losses'][-1]:.4f}, "
-              f"FID: {metrics['fid_scores'][-1]:.4f}")
-
-        # Salva checkpoint periodico
-        if (epoch + 1) % 10 == 0:
-            os.makedirs(save_path, exist_ok=True)
-            torch.save({
-                'epoch': epoch,
-                'generator_state_dict': generator.state_dict(),
-                'discriminator_state_dict': discriminator.state_dict(),
-                'optimizer_G_state_dict': optimizer_G.state_dict(),
-                'optimizer_D_state_dict': optimizer_D.state_dict(),
-                'metrics': metrics
-            }, f'{save_path}/checkpoint_epoch_{epoch+1}.pt')
-
-    return generator, discriminator, metrics
-
-def main():
-    # Hyperparameters
-    num_epochs = 200
-    batch_size = 16
-    image_size = 256
-    n_clusters = 400  # Numero di cluster come nel paper
+# Funzione di test
+def test_e2gan(generator, image_path, device):
+    if not os.path.exists(image_path):
+        raise ValueError(f"Immagine test non trovata: {image_path}")
     
-    # Device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # Transformations
-    transforms_ = transforms.Compose([
-        transforms.Resize((image_size, image_size), Image.BICUBIC),
+    transform = transforms.Compose([
+        transforms.Resize(128),
+        transforms.CenterCrop(128),
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
     
-    # Dataset completo
-    full_dataset = ImagePairsDataset(
-        originals_dir='./original_images',  # Modifica questi percorsi
-        filtered_dir='./modified_images',   # con i tuoi
-        transform=transforms_
-    )
-    
-    # Split del dataset
-    full_size = len(full_dataset)
-    train_size = int(0.8 * full_size)
-    val_size = int(0.1 * full_size)
-    test_size = full_size - train_size - val_size
+    try:
+        image = Image.open(image_path).convert('RGB')
+        image = transform(image).unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            text_embedding = torch.randn(16, 1, 256).to(device)
+            fake = generator(image, text_embedding)
+            
+        save_image(torch.cat((image, fake), -2), "test_result.png", normalize=True)
+        
+        plt.figure(figsize=(10, 5))
+        plt.subplot(1, 2, 1)
+        plt.imshow(np.transpose(image.cpu().numpy()[0], (1, 2, 0)) * 0.5 + 0.5)
+        plt.title('Input')
+        plt.axis('off')
+        
+        plt.subplot(1, 2, 2)
+        plt.imshow(np.transpose(fake.cpu().numpy()[0], (1, 2, 0)) * 0.5 + 0.5)
+        plt.title('Generata')
+        plt.axis('off')
+        plt.show()
+        
+    except Exception as e:
+        print(f"Errore durante il test: {str(e)}")
+        raise e
 
-    train_dataset, val_dataset, test_dataset = random_split(
-        full_dataset, 
-        [train_size, val_size, test_size],
-        generator=torch.Generator().manual_seed(42)
-    )
-    
-    print(f"Dataset sizes - Train: {train_size}, Val: {val_size}, Test: {test_size}")
-    
-    # Applica clustering solo al training set
-    dataset_manager = DatasetManager(n_clusters=n_clusters)
-    train_clustered = dataset_manager.create_clustered_dataset(train_dataset)
-    print(f"Clustered training set size: {len(train_clustered)}")
+def main():
+    try:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Utilizzo device: {device}")
+        
+        source_dir = "e2gan/Images/original_images"
+        target_dir = "e2gan/Images/less_modified_images"
+        
+        if not os.path.exists(source_dir):
+            raise ValueError(f"Directory sorgente non trovata: {source_dir}")
+        if not os.path.exists(target_dir):
+            raise ValueError(f"Directory target non trovata: {target_dir}")
+        
+        # Setup trasformazioni immagini
+        transform = transforms.Compose([
+            transforms.Resize(128),          # Ridimensiona a 128x128
+            transforms.CenterCrop(128),      # Crop centrale 128x128
+            transforms.ToTensor(),           # Converte in tensor
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Normalizza
+        ])
+        
+        # Inizializza i modelli
+        generator = E2GANGenerator().to(device)
+        discriminator = Discriminator().to(device)
+        
+        # Crea dataset e dataloader
+        dataset = ImagePairDataset(source_dir, target_dir, transform=transform)
+        dataloader = DataLoader(
+            dataset, 
+            batch_size=16,        # Dimensione batch
+            shuffle=True,         # Mischia i dati
+            num_workers=2         # Numero di worker per caricamento dati
+        )
+        
+        # Training del modello
+        train_e2gan(generator, discriminator, dataloader, num_epochs=200, device=device)
+        
+        # Test del modello
+        test_image_path = "e2gan/obama.jpg"
+        if os.path.exists(test_image_path):
+            test_e2gan(generator, test_image_path, device)
+        else:
+            print(f"Immagine test non trovata: {test_image_path}")
+            
+    except Exception as e:
+        print(f"Errore durante l'esecuzione: {str(e)}")
+        raise e
 
-    # DataLoaders
-    train_loader = DataLoader(
-        train_clustered,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
-    )
-    
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
-    )
-    
-    # Initialize models
-    generator = nn.DataParallel(E2GANGenerator()).to(device)
-    discriminator = nn.DataParallel(Discriminator()).to(device)
-    
-    # Initialize weights
-    generator.apply(weights_init_normal)
-    discriminator.apply(weights_init_normal)
-    
-    # Train
-    save_path = 'checkpoints'
-    generator, discriminator, metrics = train_e2gan(
-        generator,
-        discriminator,
-        train_loader,
-        val_loader,
-        num_epochs,
-        device,
-        save_path
-    )
-    
-    # Final evaluation on test set
-    print("\nFinal evaluation on test set:")
-    test_fid = evaluate_model(generator, test_loader, device)
-    print(f"Test FID score: {test_fid:.4f}")
-
-if __name__ == "__main__":
+if __name__ == "__main__":    
     main()
