@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.fid import FrechetInceptionDistancepi
 import torchvision.transforms as transforms
 from torchvision.utils import save_image, make_grid
 from PIL import Image
