@@ -9,7 +9,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import os
 import numpy as np
-from tqdm.notebook import tqdm
+from tqdm import tqdm
 
 # Blocco ResNet - utilizzato per estrarre features
 class ResNetBlock(nn.Module):
