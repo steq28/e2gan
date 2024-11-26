@@ -179,8 +179,8 @@ def train_e2gan_with_regularization(generator, discriminator, train_loader, val_
     os.makedirs(save_dir, exist_ok=True)
     criterion_gan = nn.MSELoss()
     criterion_pixel = nn.L1Loss()
-    optimizer_g = torch.optim.AdamW(generator.parameters(), lr=0.0003, betas=(0.5, 0.999))
-    optimizer_d = torch.optim.AdamW(discriminator.parameters(), lr=0.0001, betas=(0.5, 0.999))
+    optimizer_g = torch.optim.AdamW(generator.parameters(), lr=0.0003, betas=(0.5, 0.999),weight_decay=1e-1)
+    optimizer_d = torch.optim.AdamW(discriminator.parameters(), lr=0.0001, betas=(0.5, 0.999),weight_decay=1e-1)
     scheduler_g = CosineAnnealingLR(optimizer_g, T_max=num_epochs, eta_min=1e-6)
     scheduler_d = CosineAnnealingLR(optimizer_d, T_max=num_epochs, eta_min=1e-6)
     best_val_loss = float('inf')
@@ -216,7 +216,7 @@ def train_e2gan_with_regularization(generator, discriminator, train_loader, val_
             optimizer_g.zero_grad()
             pred_fake = discriminator(fake)
             loss_g_gan = criterion_gan(pred_fake, torch.ones_like(pred_fake))
-            loss_g_pixel = criterion_pixel(fake, real) * 30
+            loss_g_pixel = criterion_pixel(fake, real) * 20
             loss_g = loss_g_gan + loss_g_pixel
             loss_g.backward()
             optimizer_g.step()
