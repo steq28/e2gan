@@ -7,6 +7,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.nn.utils import spectral_norm
 from PIL import Image
 import os
+
 import numpy as np
 from tqdm import tqdm
 import time
@@ -332,7 +333,3 @@ if __name__ == '__main__':
     end_time = (time.time() - start_time)/60
     print(f"Training time: {end_time:.2f} minutes")
 
-    # Calculate FID
-    for dir in target_dir_list:
-        fid_score = calculate_fid(source_dir, dir)
-        print(f"FID score: {fid_score:.4f}")
