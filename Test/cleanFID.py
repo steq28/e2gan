@@ -2,11 +2,12 @@
 import os
 from cleanfid import fid
 import torchvision.utils
-
+import numpy as np
 import torch
+from torch.utils.data import Dataset
 import torchvision.transforms as transforms
+import torch.nn as nn
 from PIL import Image
-
 
 class ImageDataset(Dataset):
     def __init__(self, source_dir, target_dir, style_idx, transform=None):
@@ -54,6 +55,15 @@ def load_model(model_path, device):
     return model
 
 
+def test_model(model, input_image, style_idx, device):
+    """Run model inference with a specified style index."""
+    with torch.no_grad():
+        input_tensor = input_image.to(device)
+        style_idx_tensor = torch.tensor([style_idx], device=device)
+        output = model(input_tensor, style_idx_tensor)
+    return output
+
+
 # Dataset and transforms
 transform = transforms.Compose([
     transforms.Resize(256),
@@ -64,9 +74,11 @@ transform = transforms.Compose([
 
 source_dir = '/kaggle/input/test-multiprompt/original_images'
 
-target_dir_list = ['/kaggle/input/test-multiprompt/albino',
-                   '/kaggle/input/test-multiprompt/blonde',
-                   '/kaggle/input/test-multiprompt/gogh']
+target_dir_list = [
+    'albino', 'blonde', 'gogh', 'greenlantern', 'old', 'sculpture', 'whitewalker'
+]
+target_dir_list = [f'/kaggle/input/test-multiprompt/{style}' for style in target_dir_list]
+
     
 
 # Create indexed datasets
@@ -77,14 +89,14 @@ for style_idx, target_dir in enumerate(target_dir_list):
 
 
 # Load the model (from working or from input)
-# model_path = '/kaggle/input/3prompt/pytorch/default/1/best_model.pth'
-model_path = '/kaggle/working/models/best_model.pth'
+model_path = '/kaggle/input/modelprova/pytorch/default/1/best_model.pth'
+# model_path = '/kaggle/working/models/best_model.pth'
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model = load_model(model_path, device)
 
-# 0 = albino, 1 = blonde, 2 = van gogh
-style_array = [0, 1, 2]
+# 0 = albino, 1 = blonde, 2 = van gogh, 3 = green lantern, 4 = old, 5 = sculpture, 6 = whitewalker
+style_array = [0, 1, 2, 3, 4, 5, 6]
 
 # the idea is to create this structure
 # working
@@ -92,10 +104,12 @@ style_array = [0, 1, 2]
 #     |_ albino -> contains 30 modified taken from diffusion from albino (diffusion_0_0, ... diffusion_0_30)
 #     |_ blonde -> contains 30 modified taken from diffusion from blonde (diffusion_1_0, ... diffusion_1_30)
 #     |_ gogh -> contains 30 modified taken from diffusion from gogh (diffusion_2_0, ... diffusion_2_30)
+#     |...
 #  |_created
 #     |_0 -> contains 30 images generated with albino prompt (generated_0_0, ... generated_0_29)
 #     |_1 -> contains 30 images generated with blonde prompt (generated_1_0, ... generated_1_29)
 #     |_2 -> contains 30 images generated with gogh prompt (generated_2_0, ... generated_2_29)
+#     |...
 
 # Generate 30 images for each style
 for style in style_array:
@@ -127,17 +141,14 @@ for style in style_array:
 
         print(f"Saved diffusion image in: {save_diffusion_path}")
 
-created_dir = ['/kaggle/working/created/0', '/kaggle/working/created/1', '/kaggle/working/created/2']
-diffusion_dir = ['/kaggle/working/diffusion/0', '/kaggle/working/diffusion/1', '/kaggle/working/diffusion/2']
+# Compute FID scores
+created_dirs = [f'/kaggle/working/created/{i}' for i in range(len(datasets))]
+diffusion_dirs = [f'/kaggle/working/diffusion/{i}' for i in range(len(datasets))]
 
-# Compute FID for every style by comparing created images - diffusion images
-for style in style_array:
-    if style == 0:
-        score = fid.compute_fid(created_dir[0], diffusion_dir[0])
-        print(f"FID for style {style}: {score}")
-    elif style == 1:
-        score = fid.compute_fid(created_dir[1], diffusion_dir[1])
-        print(f"FID for style {style}: {score}")
-    else:
-        score = fid.compute_fid(created_dir[2], diffusion_dir[2])
-        print(f"FID for style {style}: {score}")
+fid_scores = [fid.compute_fid(created_dirs[i], diffusion_dirs[i]) for i in range(len(datasets))]
+
+for style, score in enumerate(fid_scores):
+    print(f"FID for style {style}: {score}")
+
+median = np.median(fid_scores)
+print(f"The overall FID score is {median}")
