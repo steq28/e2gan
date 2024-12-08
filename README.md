@@ -1,4 +1,5 @@
 # Reproducing E2GAN: Efficient Training of Efficient GANs for Image-to-Image Translation
+![motivation](https://github.com/user-attachments/assets/7a66154e-e1f1-4f63-a8e7-3bdcebbf5559)
 
 This repository contains the implementation to reproduce the results of the paper:
 
