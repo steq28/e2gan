@@ -2,6 +2,10 @@
 import os
 import zipfile
 from cleanfid import fid
+from torchvision.transforms import ToPILImage
+from torchvision.transforms.functional import to_pil_image
+import matplotlib.pyplot as plt
+
 
 def process_single_image(image_path, generator, text_prompt, transform, device):
     """Processa un'immagine singola con il generatore e il prompt testuale."""
@@ -20,8 +24,17 @@ def process_single_image(image_path, generator, text_prompt, transform, device):
     # Convertire in immagine PIL
     generated_image_tensor = generated_image_tensor.squeeze(0).cpu()
     generated_image = ToPILImage()(torch.clamp((generated_image_tensor + 1) / 2, 0, 1))  # Denormalizzazione
-    
+
+    # plt.imshow(generated_image)
+    # plt.show()
+
     return original_image, generated_image
+
+# Prepara le trasformazioni
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
 
 start_index = 1001
 
@@ -56,10 +69,10 @@ for j in range(len(prompts)):
 # Compute FID scores
 fid_scores = []
 
-for folder in folders:
-    real_path = f'/kaggle/input/test-multiprompt/{style}'
-    gen_path = f'/kaggle/working/{style}'
-    fid_scores.append(fid.compute_fid(real_path, gen_path))
+for s in style:
+    diff_path = f'/kaggle/input/test-multiprompt/{s}'
+    gen_path = f'/kaggle/working/{s}'
+    fid_scores.append(fid.compute_fid(diff_path, gen_path))
 
 # Calculate the median FID score
 median_fid = np.mean(fid_scores)
